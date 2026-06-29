@@ -174,11 +174,13 @@ class AsyncTransferQueueClient:
     async def async_get_meta(
         self,
         data_fields: list[str],
-        batch_size: int,
-        partition_id: str,
+        batch_size: Optional[int] = None,
+        partition_id: str = "",
         mode: str = "fetch",
         task_name: Optional[str] = None,
         sampling_config: Optional[dict[str, Any]] = None,
+        token_budget: Optional[int] = None,
+        is_last: bool = False,
         socket: Optional[zmq.asyncio.Socket] = None,
     ) -> BatchMeta:
         """Asynchronously fetch data metadata from the controller via ZMQ.
@@ -193,6 +195,8 @@ class AsyncTransferQueueClient:
                 - 'insert': Internal usage - should not be used by users
             task_name: Optional task name associated with the request
             sampling_config: Optional sampling configuration for custom samplers.
+            is_last: In insert mode, mark this as the final batch of the partition so
+                the controller can detect end-of-stream without a preset total count.
             socket: ZMQ async socket for message transmission (injected by decorator)
 
         Returns:
@@ -242,6 +246,11 @@ class AsyncTransferQueueClient:
                 "mode": mode,
                 "task_name": task_name,
                 "sampling_config": sampling_config,
+                "token_budget": token_budget,
+                # is_last: producer marks the final insert batch of a partition so
+                # the controller can flag end-of-stream without a preset total. Only
+                # meaningful in mode="insert".
+                "is_last": is_last,
             },
         )
 
@@ -339,6 +348,8 @@ class AsyncTransferQueueClient:
         data: TensorDict,
         metadata: Optional[BatchMeta] = None,
         partition_id: Optional[str] = None,
+        custom_meta: Optional[list[dict[str, Any]]] = None,
+        is_last: bool = False,
     ) -> BatchMeta:
         """Asynchronously write data to storage units based on metadata.
 
@@ -347,6 +358,13 @@ class AsyncTransferQueueClient:
 
         During put, the custom_meta in metadata will update the corresponding custom_meta in
         TransferQueue Controller.
+
+        If ``custom_meta`` is provided (a per-sample list aligned with ``data`` rows),
+        it is attached to the metadata BEFORE the data is written, so it rides the same
+        readiness notification and lands atomically with the samples becoming consumable.
+        This avoids a separate ``async_set_custom_meta`` round-trip and the associated
+        race where a streaming consumer fetches a ready sample before its custom_meta
+        has been set.
 
         Note:
             When using multiple workers for distributed execution, there may be data
@@ -357,6 +375,9 @@ class AsyncTransferQueueClient:
             metadata: Records the metadata of a batch of data samples, containing index and
                       storage unit information. If None, metadata will be auto-generated.
             partition_id: Target data partition id (required if metadata is not provided)
+            is_last: Mark this as the final insert batch of the partition (streaming
+                end-of-stream). Only honored on the insert path (metadata is None);
+                ignored with a warning when explicit metadata is provided.
 
         Returns:
             BatchMeta: The metadata used for the put operation (currently returns the input metadata or auto-retrieved
@@ -418,17 +439,31 @@ class AsyncTransferQueueClient:
                 batch_size=data.batch_size[0],
                 partition_id=partition_id,
                 mode="insert",
+                is_last=is_last,
             )
+        elif is_last:
+            # is_last only applies to the insert path (auto-generated metadata).
+            # A backfill put with explicit metadata writes into existing samples
+            # and must not announce end-of-stream.
+            logger.warning(f"[{self.client_id}]: is_last=True ignored on put with explicit metadata.")
 
         if not metadata or metadata.size == 0:
             raise ValueError("metadata cannot be none or empty")
+
+        # Attach inline custom_meta before the write so it rides put_data's readiness
+        # notification and lands atomically with the samples becoming consumable.
+        if custom_meta is not None:
+            metadata.update_custom_meta(custom_meta)
 
         with limit_pytorch_auto_parallel_threads(
             target_num_threads=TQ_NUM_THREADS, info=f"[{self.client_id}] async_put"
         ):
             await self.storage_manager.put_data(data, metadata)
 
-        await self.async_set_custom_meta(metadata)
+        # Inline custom_meta is already delivered atomically via put_data → notify;
+        # only fall back to the separate RPC when it was set out-of-band on metadata.
+        if custom_meta is None:
+            await self.async_set_custom_meta(metadata)
 
         logger.debug(
             f"[{self.client_id}]: partition {partition_id} put {metadata.size} samples to storage units successfully."
@@ -694,6 +729,99 @@ class AsyncTransferQueueClient:
                 )
         except Exception as e:
             raise RuntimeError(f"[{self.client_id}]: Error in get_consumption_status: {str(e)}") from e
+
+    @dynamic_socket(socket_name="request_handle_socket")
+    async def async_check_stream_drained(
+        self,
+        task_name: str,
+        partition_id: str,
+        socket: Optional[zmq.asyncio.Socket] = None,
+    ) -> bool:
+        """Streaming end-of-stream test (no preset global batch).
+
+        Returns True iff the producer announced completion for the partition AND
+        every actually-inserted sample has been consumed by ``task_name``. Use this
+        instead of :meth:`async_check_consumption_status` on the dynamic-batch
+        streaming path, where a tensor-wide ``.all()`` check is unreliable
+        (unactivated pre-allocated rows never reach 1).
+
+        Args:
+            task_name: Name of the task to check consumption for
+            partition_id: Partition id to check
+            socket: ZMQ async socket for message transmission (injected by decorator)
+
+        Returns:
+            bool: True if the partition is fully produced and fully consumed.
+        """
+        assert socket is not None
+        request_msg = ZMQMessage.create(
+            request_type=ZMQRequestType.CHECK_STREAM_DRAINED,  # type: ignore[arg-type]
+            sender_id=self.client_id,
+            receiver_id=self._controller.id,
+            body={
+                "partition_id": partition_id,
+                "task_name": task_name,
+            },
+        )
+
+        try:
+            await socket.send_multipart(request_msg.serialize())
+            response_serialized = await socket.recv_multipart(copy=False)
+            response_msg = ZMQMessage.deserialize(response_serialized)
+
+            if response_msg.request_type == ZMQRequestType.CHECK_STREAM_DRAINED_RESPONSE:
+                return bool(response_msg.body.get("drained", False))
+            raise RuntimeError(
+                f"[{self.client_id}]: Failed to check stream drained from controller {self._controller.id}: "
+                f"{response_msg.body.get('message', 'Unknown error')}"
+            )
+        except Exception as e:
+            raise RuntimeError(f"[{self.client_id}]: Error in check_stream_drained: {str(e)}") from e
+
+    @dynamic_socket(socket_name="request_handle_socket")
+    async def async_check_production_completed(
+        self,
+        partition_id: str,
+        socket: Optional[zmq.asyncio.Socket] = None,
+    ) -> bool:
+        """Producer-side completion test (no preset global batch, no consumption).
+
+        Returns True iff the partition's producer has declared the final batch via
+        ``is_last`` AND its data is ready. Use this instead of
+        :meth:`async_check_production_status` (a tensor-wide ``.all()`` that relied
+        on pre-allocating the partition to ``global_batch_size``) as the
+        weight-update / training-admission gate on the dynamic-batch path.
+
+        Args:
+            partition_id: Partition id to check
+            socket: ZMQ async socket for message transmission (injected by decorator)
+
+        Returns:
+            bool: True if the partition's production is complete.
+        """
+        assert socket is not None
+        request_msg = ZMQMessage.create(
+            request_type=ZMQRequestType.CHECK_PRODUCTION_COMPLETED,  # type: ignore[arg-type]
+            sender_id=self.client_id,
+            receiver_id=self._controller.id,
+            body={
+                "partition_id": partition_id,
+            },
+        )
+
+        try:
+            await socket.send_multipart(request_msg.serialize())
+            response_serialized = await socket.recv_multipart(copy=False)
+            response_msg = ZMQMessage.deserialize(response_serialized)
+
+            if response_msg.request_type == ZMQRequestType.CHECK_PRODUCTION_COMPLETED_RESPONSE:
+                return bool(response_msg.body.get("completed", False))
+            raise RuntimeError(
+                f"[{self.client_id}]: Failed to check production completed from controller "
+                f"{self._controller.id}: {response_msg.body.get('message', 'Unknown error')}"
+            )
+        except Exception as e:
+            raise RuntimeError(f"[{self.client_id}]: Error in check_production_completed: {str(e)}") from e
 
     @dynamic_socket(socket_name="request_handle_socket")
     async def async_get_production_status(
@@ -1197,6 +1325,8 @@ class TransferQueueClient(AsyncTransferQueueClient):
         self._get_consumption_status = _make_sync(self.async_get_consumption_status)
         self._get_production_status = _make_sync(self.async_get_production_status)
         self._check_consumption_status = _make_sync(self.async_check_consumption_status)
+        self._check_stream_drained = _make_sync(self.async_check_stream_drained)
+        self._check_production_completed = _make_sync(self.async_check_production_completed)
         self._check_production_status = _make_sync(self.async_check_production_status)
         self._get_partition_list = _make_sync(self.async_get_partition_list)
         self._set_custom_meta = _make_sync(self.async_set_custom_meta)
@@ -1209,11 +1339,12 @@ class TransferQueueClient(AsyncTransferQueueClient):
     def get_meta(
         self,
         data_fields: list[str],
-        batch_size: int,
-        partition_id: str,
+        batch_size: Optional[int] = None,
+        partition_id: str = "",
         mode: str = "fetch",
         task_name: Optional[str] = None,
         sampling_config: Optional[dict[str, Any]] = None,
+        token_budget: Optional[int] = None,
     ) -> BatchMeta:
         """Synchronously fetch data metadata from the controller via ZMQ.
 
@@ -1272,6 +1403,7 @@ class TransferQueueClient(AsyncTransferQueueClient):
             mode=mode,
             task_name=task_name,
             sampling_config=sampling_config,
+            token_budget=token_budget,
         )
 
     def set_custom_meta(self, metadata: BatchMeta) -> None:
@@ -1299,7 +1431,11 @@ class TransferQueueClient(AsyncTransferQueueClient):
         return self._set_custom_meta(metadata=metadata)
 
     def put(
-        self, data: TensorDict, metadata: Optional[BatchMeta] = None, partition_id: Optional[str] = None
+        self,
+        data: TensorDict,
+        metadata: Optional[BatchMeta] = None,
+        partition_id: Optional[str] = None,
+        is_last: bool = False,
     ) -> BatchMeta:
         """Synchronously write data to storage units based on metadata.
 
@@ -1318,6 +1454,8 @@ class TransferQueueClient(AsyncTransferQueueClient):
             metadata: Records the metadata of a batch of data samples, containing index and
                       storage unit information. If None, metadata will be auto-generated.
             partition_id: Target data partition id (required if metadata is not provided)
+            is_last: Mark this as the final insert batch of the partition (streaming
+                end-of-stream). Only honored on the insert path (metadata is None).
 
         Returns:
             BatchMeta: The metadata used for the put operation (currently returns the input metadata or auto-retrieved
@@ -1356,7 +1494,7 @@ class TransferQueueClient(AsyncTransferQueueClient):
             >>> # This will create metadata in "insert" mode internally.
             >>> metadata = client.put(data=prompts_repeated_batch, partition_id=current_partition_id)
         """
-        return self._put(data=data, metadata=metadata, partition_id=partition_id)
+        return self._put(data=data, metadata=metadata, partition_id=partition_id, is_last=is_last)
 
     def get_data(self, metadata: BatchMeta) -> TensorDict:
         """Synchronously fetch data from storage units and organize into TensorDict.
@@ -1483,6 +1621,37 @@ class TransferQueueClient(AsyncTransferQueueClient):
             >>> print(f"All samples consumed: {is_consumed}")
         """
         return self._check_consumption_status(task_name=task_name, partition_id=partition_id)
+
+    def check_stream_drained(self, task_name: str, partition_id: str) -> bool:
+        """Synchronously check streaming end-of-stream for a (partition, task).
+
+        Returns True iff the producer announced completion AND every actually-
+        inserted sample has been consumed by ``task_name``. Preferred over
+        :meth:`check_consumption_status` on the dynamic-batch streaming path.
+
+        Args:
+            task_name: Name of the task to check consumption for
+            partition_id: Partition id to check
+
+        Returns:
+            bool: True if the partition is fully produced and fully consumed.
+        """
+        return self._check_stream_drained(task_name=task_name, partition_id=partition_id)
+
+    def check_production_completed(self, partition_id: str) -> bool:
+        """Synchronously check producer-side completion for a partition.
+
+        Returns True iff the producer declared the final batch via ``is_last`` AND
+        its data is ready. Preferred over :meth:`check_production_status` as the
+        weight-update / training-admission gate on the dynamic-batch path.
+
+        Args:
+            partition_id: Partition id to check
+
+        Returns:
+            bool: True if the partition's production is complete.
+        """
+        return self._check_production_completed(partition_id=partition_id)
 
     def check_production_status(self, data_fields: list[str], partition_id: str) -> bool:
         """Synchronously check if all samples for a partition are ready (produced) for consumption.
