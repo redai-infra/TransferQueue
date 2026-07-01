@@ -19,7 +19,6 @@ import os
 import threading
 from functools import wraps
 from typing import Any, Callable, Optional
-from uuid import uuid4
 
 import torch
 import zmq
@@ -34,11 +33,14 @@ from transfer_queue.storage import (
     TransferQueueStorageManagerFactory,
 )
 from transfer_queue.utils.common import limit_pytorch_auto_parallel_threads
+from transfer_queue.utils.socket_pool import (
+    SocketPoolManager,
+    invoke_with_pool,
+)
 from transfer_queue.utils.zmq_utils import (
     ZMQMessage,
     ZMQRequestType,
     ZMQServerInfo,
-    create_zmq_socket,
     format_zmq_address,
 )
 
@@ -78,6 +80,9 @@ class AsyncTransferQueueClient:
             raise TypeError(f"controller_info must be ZMQServerInfo, got {type(controller_info)}")
         self.client_id = client_id
         self._controller: ZMQServerInfo = controller_info
+        # Owns the long-lived DEALER pools used by ``dynamic_socket``;
+        # released by ``close()``.
+        self._socket_pool_manager = SocketPoolManager()
         logger.info(f"[{self.client_id}]: Registered Controller server {controller_info.id} at {controller_info.ip}")
 
     def initialize_storage_manager(
@@ -99,22 +104,29 @@ class AsyncTransferQueueClient:
             manager_type, controller_info=self._controller, config=config
         )
 
-    # TODO (TQStorage): Provide a general dynamic socket function for both Client & Storage @huazhong.
     @staticmethod
     def dynamic_socket(socket_name: str):
-        """Decorator to auto-manage ZMQ sockets for Controller/Storage servers.
+        """Decorator: route each call through a long-lived DEALER pool.
 
-        Handles socket lifecycle: create -> connect -> inject -> close.
+        The pool is keyed by ``(current_loop, controller_id, socket_name)``
+        and grows lazily up to ``TQ_POOL_SIZE``. Each call is wrapped in
+        ``asyncio.wait_for(TQ_REQUEST_TIMEOUT_S)`` and retried up to
+        ``TQ_REQUEST_MAX_ATTEMPTS`` times on failure, with the suspect
+        socket dropped between attempts. See ``transfer_queue.utils.socket_pool``
+        for the rationale (TIME_WAIT exhaustion under high-throughput
+        async RL training, and ROUTER reply mis-routing protection).
 
         Args:
-            socket_name: Port name from server config to use for ZMQ connection (e.g., "data_req_port")
+            socket_name: Port name from server config to use for ZMQ
+                connection (e.g., ``"request_handle_socket"``).
 
         Decorated Function Requirements:
-            1. Must be an async class method (needs `self`)
-            2. `self` must have:
-               - `_controller`: Server registry
-               - `client_id`: Unique client ID for socket identity
-            3. Receives ZMQ socket via `socket` keyword argument (injected by decorator)
+            1. Must be an async class method (needs ``self``).
+            2. ``self`` must have:
+               - ``_controller``: ZMQServerInfo of the controller.
+               - ``client_id``: Unique client ID for socket identity.
+            3. Receives ZMQ socket via ``socket`` keyword argument
+               (injected by decorator).
         """
 
         def decorator(func: Callable):
@@ -124,31 +136,34 @@ class AsyncTransferQueueClient:
                 if not server_info:
                     raise RuntimeError("No controller registered")
 
-                context = zmq.asyncio.Context()
+                # ``loop_id`` MUST be in the identity prefix. Some callers
+                # drive the same client instance from two asyncio loops
+                # (e.g. a bg loop for sync wrappers + a shared loop for
+                # async calls). Without loop_id, both pools' "first
+                # socket" would share the identity ``{client_id}_to_
+                # {server_id}-0`` and the ROUTER would route replies
+                # non-deterministically between them — one side's recv
+                # then hangs forever.
+                loop_id = id(asyncio.get_running_loop())
+                identity_prefix = f"{self.client_id}_to_{server_info.id}_loop{loop_id}"
                 address = format_zmq_address(server_info.ip, server_info.ports.get(socket_name))
-                identity = f"{self.client_id}_to_{server_info.id}_{uuid4().hex[:8]}".encode()
-                sock = create_zmq_socket(context, zmq.DEALER, identity=identity, ip=server_info.ip)
 
-                try:
-                    sock.connect(address)
-                    logger.debug(
-                        f"[{self.client_id}]: Connected to Controller {server_info.id} at {address} "
-                        f"with identity {identity.decode()}"
-                    )
+                pool = self._socket_pool_manager.get_or_create(
+                    pool_key=(server_info.id, socket_name),
+                    address=address,
+                    ip=server_info.ip,
+                    identity_prefix=identity_prefix,
+                )
 
+                async def _call(sock):
                     kwargs["socket"] = sock
                     return await func(self, *args, **kwargs)
-                except Exception as e:
-                    logger.error(f"[{self.client_id}]: Error in socket operation with Controller {server_info.id}: {e}")
-                    raise
-                finally:
-                    try:
-                        if not sock.closed:
-                            sock.close(linger=-1)
-                    except Exception as e:
-                        logger.warning(f"[{self.client_id}]: Error closing socket to Controller {server_info.id}: {e}")
 
-                    context.term()
+                return await invoke_with_pool(
+                    pool,
+                    _call,
+                    label=f"{self.client_id} {socket_name}.{func.__name__}",
+                )
 
             return wrapper
 
@@ -1236,7 +1251,12 @@ class AsyncTransferQueueClient:
             raise RuntimeError(f"[{self.client_id}]: Error in kv_list: {str(e)}") from e
 
     def close(self) -> None:
-        """Close the client and cleanup resources including storage manager."""
+        """Close the client and cleanup resources including socket pools and storage manager."""
+        try:
+            if hasattr(self, "_socket_pool_manager"):
+                self._socket_pool_manager.close()
+        except Exception as e:
+            logger.warning(f"[{self.client_id}]: Error closing socket pools: {e}")
         try:
             if hasattr(self, "storage_manager") and self.storage_manager:
                 if hasattr(self.storage_manager, "close"):
