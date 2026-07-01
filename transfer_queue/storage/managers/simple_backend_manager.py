@@ -22,7 +22,6 @@ from collections.abc import Mapping
 from functools import wraps
 from operator import itemgetter
 from typing import Any, Callable, NamedTuple, Optional
-from uuid import uuid4
 
 import torch
 import zmq
