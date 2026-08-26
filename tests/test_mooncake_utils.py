@@ -34,6 +34,13 @@ _DEFAULT_ALIGN = 256
 _has_cuda_python = importlib.util.find_spec("cuda") is not None
 
 
+def test_mooncake_correctness_contract_version_is_public():
+    import transfer_queue as tq
+
+    assert tq.MOONCAKE_CORRECTNESS_CONTRACT_VERSION == 1
+    assert "MOONCAKE_CORRECTNESS_CONTRACT_VERSION" in tq.__all__
+
+
 def _aligned(n: int) -> int:
     return (n + _DEFAULT_ALIGN - 1) // _DEFAULT_ALIGN * _DEFAULT_ALIGN
 
