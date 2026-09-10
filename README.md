@@ -191,6 +191,48 @@ pip install TransferQueue
    ```bash
    pip install .
    ```
+
+### Pin TransferQueue actors to Ray custom-resource nodes
+
+TransferQueue can optionally hard-pin the controller and its built-in
+`SimpleStorageUnit` actors to alive Ray nodes that advertise a positive custom
+resource. Configure either actor type independently:
+
+```yaml
+controller:
+  required_node_resource: control_pool
+backend:
+  SimpleStorage:
+    required_node_resource: storage_pool
+```
+
+When configured, actor placement uses hard node affinity (`soft=False`) and
+initialization fails immediately if no alive node provides the requested
+resource. Leaving either option unset or `null` preserves its existing Ray
+scheduling behavior. The resource names are user-defined Ray resource labels;
+TransferQueue does not reserve or consume their capacity.
+
+Placement is round-robin within each node's total one-CPU actor capacity.
+Storage placement subtracts the running controller's CPU on its actual Ray
+node, including when controller affinity is unset. An impossible layout raises
+`ValueError` rather than assigning more persistent actors than a node can hold.
+Storage affinity is checked before controller creation and checked again after
+the controller starts. An affinity failure at that second check rolls back the
+controller created by this attempt, so initialization can be retried.
+
+These checks are not atomic CPU reservations: other workloads may still occupy
+the selected nodes and Ray may wait for their CPUs. If an affinity-bound actor
+dies or becomes unschedulable during startup, the failed initialization cleans
+up its owned actors; attaching processes discard a failed controller handle so
+an explicit retry can discover a replacement. This is not automatic recovery
+of an already initialized TransferQueue deployment.
+
+Set `TQ_LOGGING_LEVEL=INFO` before starting the process that initializes
+TransferQueue to log each configured actor's affinity selection. The
+`Applying node affinity:` message includes the actor name,
+`required_node_resource`, selected `node_id`, and `soft=false`. This records
+the scheduling strategy being submitted, not confirmation that the actor is
+running on that node; verify the actor's actual placement through Ray state.
    
 ### Build wheel package from source code
 
